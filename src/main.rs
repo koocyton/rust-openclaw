@@ -1,3 +1,5 @@
+#[macro_use]
+mod log;
 mod bot;
 mod config;
 mod executor;

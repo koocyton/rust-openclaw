@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tracing::{error, info};
 
@@ -8,9 +8,7 @@ use crate::config::ExecutorConfig;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct TaskCommand {
-    /// 要执行的 shell 命令
     pub command: String,
-    /// 命令说明
     #[serde(default)]
     pub description: String,
 }
@@ -33,15 +31,19 @@ impl Executor {
         Self { config }
     }
 
-    /// 执行单条命令
     pub async fn run_command(&self, cmd: &str) -> Result<CommandResult> {
-        info!(cmd = %cmd, "执行命令");
-
         let working_dir = self
             .config
             .working_dir
             .as_deref()
             .unwrap_or(".");
+
+        tlog!("CMD", "执行: {}", cmd);
+        tlog!("CMD", "工作目录: {}", working_dir);
+        tlog!("CMD", "超时: {}s", self.config.timeout_secs);
+        info!(cmd = %cmd, "执行命令");
+
+        let start = Instant::now();
 
         let output = tokio::time::timeout(
             Duration::from_secs(self.config.timeout_secs),
@@ -55,6 +57,8 @@ impl Executor {
         .with_context(|| format!("命令超时 ({} 秒): {cmd}", self.config.timeout_secs))?
         .with_context(|| format!("命令执行失败: {cmd}"))?;
 
+        let elapsed = start.elapsed();
+
         let result = CommandResult {
             command: cmd.to_string(),
             success: output.status.success(),
@@ -64,29 +68,40 @@ impl Executor {
         };
 
         if result.success {
-            info!(cmd = %cmd, "命令执行成功");
+            tlog!("CMD", "成功 (exit=0, 耗时 {:.2}s)", elapsed.as_secs_f64());
         } else {
+            tlog!("CMD", "失败 (exit={:?}, 耗时 {:.2}s)", result.exit_code, elapsed.as_secs_f64());
             error!(cmd = %cmd, code = ?result.exit_code, stderr = %result.stderr, "命令执行失败");
+        }
+
+        if !result.stdout.is_empty() {
+            tlog!("CMD", "stdout ({} 字节):\n{}", result.stdout.len(), truncate_str(&result.stdout, 1000));
+        }
+        if !result.stderr.is_empty() {
+            tlog!("CMD", "stderr ({} 字节):\n{}", result.stderr.len(), truncate_str(&result.stderr, 500));
         }
 
         Ok(result)
     }
 
-    /// 批量执行命令列表
     pub async fn run_commands(&self, commands: &[TaskCommand]) -> Vec<CommandResult> {
+        let total_start = Instant::now();
+        tlog!("CMD", "批量执行 {} 条命令", commands.len());
+
         let mut results = Vec::new();
-        for task in commands {
-            info!(desc = %task.description, cmd = %task.command, "执行任务");
+        for (i, task) in commands.iter().enumerate() {
+            tlog!("CMD", "[{}/{}] {} → {}", i + 1, commands.len(), task.description, task.command);
             match self.run_command(&task.command).await {
                 Ok(result) => {
                     let success = result.success;
                     results.push(result);
                     if !success {
-                        info!("命令失败，停止后续执行");
+                        tlog!("CMD", "命令失败，停止后续执行");
                         break;
                     }
                 }
                 Err(e) => {
+                    tlog!("CMD", "命令异常: {}", e);
                     error!(err = %e, "命令执行异常");
                     results.push(CommandResult {
                         command: task.command.clone(),
@@ -99,6 +114,16 @@ impl Executor {
                 }
             }
         }
+
+        tlog!("CMD", "批量执行完毕 (总耗时 {:.2}s)", total_start.elapsed().as_secs_f64());
         results
+    }
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...(截断)", &s[..max])
     }
 }
