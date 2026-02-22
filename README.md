@@ -43,8 +43,8 @@ Telegram 频道/群组消息
 
 ## 工作流程
 
-1. **启动** — 读取 `config.toml`，清理 Webhook，启动 Long Polling
-2. **监听** — 通过 Telegram Bot API 长轮询接收消息（支持频道/群组/私聊）
+1. **启动** — 读取 `config.toml`；若配置了 `webhook_url` + `webhook_listen` 则使用 **Webhook 模式**，否则清理 Webhook 并启动 **Long Polling**
+2. **监听** — Webhook 下由 Telegram 主动推送更新到你的 HTTPS 地址；Polling 下通过长轮询拉取消息（均支持频道/群组/私聊）
 3. **分析** — 发送「🔄 正在分析...」，调用 LLM 判断意图
 4. **处理**
    - 提问 → LLM 直接回答，编辑覆盖状态消息
@@ -128,12 +128,74 @@ RUST_LOG=debug ./target/release/rust-bot
 4. 启动程序，发送一条消息，从日志中获取 `chat_id`
 5. 将 `chat_id` 填入 `config.toml` 的 `allowed_chat_ids`
 
+### Webhook 模式与内网暴露（推荐频道使用）
+
+使用 **Webhook** 时，Telegram 主动把更新推到你的 HTTPS 地址，通常比 Long Polling 更稳定、延迟更低，适合频道/群组。
+
+**要求**：`webhook_url` 必须是 **HTTPS**、且能从公网访问。若 bot 跑在内网，需要把本机端口暴露到公网。
+
+**免费、相对稳定的内网暴露方式：**
+
+1. **Cloudflare Tunnel（推荐）**  
+   - 免费、稳定，无需公网 IP 或路由器端口映射。  
+   - 需要有一个域名在 Cloudflare 托管。  
+
+   **从零用 Cloudflare Tunnel 暴露 8443（逐步操作）：**
+
+   1. **安装 cloudflared**（以 macOS 为例，其他见 [官方安装说明](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation/)）：
+      ```bash
+      brew install cloudflared
+      ```
+   2. **登录并创建隧道**：
+      ```bash
+      cloudflared tunnel login
+      cloudflared tunnel create rust-bot
+      ```
+      执行后会输出隧道 ID（如 `abcd1234-...`），并生成凭证文件 `~/.cloudflared/<TUNNEL_ID>.json`。
+   3. **把子域名解析到该隧道**（把 `yourdomain.com` 换成你的域名，`rust-bot` 即子域名）：
+      ```bash
+      cloudflared tunnel route dns rust-bot rust-bot.yourdomain.com
+      ```
+   4. **新建隧道配置文件**（如 `~/.cloudflared/config.yml`），写入以下内容（**可直接复制**，只需把 `rust-bot` 和端口按需修改）：
+      ```yaml
+      tunnel: rust-bot
+      credentials-file: /Users/你的用户名/.cloudflared/<TUNNEL_ID>.json
+
+      ingress:
+        - hostname: rust-bot.yourdomain.com
+          service: http://localhost:8443
+        - service: http_status:404
+      ```
+      注意：`credentials-file` 里的 `<TUNNEL_ID>` 换成第 2 步输出的 ID；`yourdomain.com` 换成你的域名。
+   5. **启动隧道**（先确保本机已启动 rust-bot 并监听 8443）：
+      ```bash
+      cloudflared tunnel run rust-bot
+      ```
+      若未用默认路径，可指定配置：`cloudflared tunnel --config /path/to/config.yml run rust-bot`。
+   6. **在 config.toml 里配置 Webhook**：
+      ```toml
+      webhook_url = "https://rust-bot.yourdomain.com"
+      webhook_listen = "0.0.0.0:8443"
+      ```
+   7. 启动 rust-bot，Telegram 的更新会经 `https://rust-bot.yourdomain.com` 推到本机 8443。
+
+   - 文档：[Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/)
+
+2. **ngrok**  
+   - 免费版可快速得到一条 HTTPS 域名，适合本地调试。  
+   - 安装后：`ngrok http 8443`，把生成的 `https://xxx.ngrok.io` 填到 `webhook_url`。  
+   - 免费域名会变，重启或换地址后需更新配置并重启 bot。
+
+**简要步骤**：在 `config.toml` 中同时设置 `webhook_url`（公网 HTTPS）和 `webhook_listen`（如 `0.0.0.0:8443`），启动 bot 即可使用 Webhook；不配则自动退回到 Long Polling。
+
 ## 配置说明
 
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
 | `telegram.bot_token` | Telegram Bot API Token | 必填 |
 | `telegram.allowed_chat_ids` | 允许的聊天 ID 白名单，空数组表示不限制 | `[]` |
+| `telegram.webhook_url` | Webhook 模式：公网 HTTPS 地址（Telegram 推送更新的 URL） | 无，不配则用 Long Polling |
+| `telegram.webhook_listen` | Webhook 模式：本机监听地址，如 `0.0.0.0:8443` | 无 |
 | `llm.base_url` | OpenAI 兼容 API 的 Base URL | 必填 |
 | `llm.api_key` | LLM API Key | 必填 |
 | `llm.model` | 模型名称 | 必填 |

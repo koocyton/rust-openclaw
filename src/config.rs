@@ -19,6 +19,12 @@ pub struct TelegramConfig {
     /// 允许接收消息的聊天 ID 列表（频道/群组/用户），留空则接收所有
     #[serde(default)]
     pub allowed_chat_ids: Vec<i64>,
+    /// Webhook 模式：公网 HTTPS 地址（Telegram 将把更新推送到此 URL）。与 webhook_listen 同时配置时启用 Webhook，否则使用 Long Polling
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    /// Webhook 模式：本机监听地址，如 "0.0.0.0:8443"。需与 webhook_url 同时配置
+    #[serde(default)]
+    pub webhook_listen: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

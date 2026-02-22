@@ -1,9 +1,11 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use teloxide::prelude::*;
 use teloxide::types::{InputFile, MessageId};
+use teloxide::update_listeners::webhooks;
 use tracing::{error, info, warn};
 
 use crate::config::AppConfig;
@@ -750,22 +752,10 @@ pub async fn run(config: AppConfig) -> Result<()> {
             ),
         );
 
-    tlog!("启动", "清理 webhook...");
-    let delete_url = format!(
-        "https://api.telegram.org/bot{}/deleteWebhook?drop_pending_updates=true",
-        &config.telegram.bot_token
-    );
-    match reqwest::get(&delete_url).await {
-        Ok(resp) => tlog!("启动", "deleteWebhook: {}", resp.status()),
-        Err(e) => tlog!("启动", "deleteWebhook 失败: {}", e),
-    }
-
-    tlog!("启动", "开始 polling 循环...");
-
     let llm_clone = llm.clone();
     let executor_clone = executor.clone();
 
-    Dispatcher::builder(bot, handler)
+    let mut dp = Dispatcher::builder(bot.clone(), handler)
         .dependencies(dptree::deps![
             llm_clone,
             executor_clone,
@@ -780,9 +770,41 @@ pub async fn run(config: AppConfig) -> Result<()> {
         })
         .error_handler(LoggingErrorHandler::with_custom_text("消息处理出错"))
         .enable_ctrlc_handler()
-        .build()
-        .dispatch()
-        .await;
+        .build();
+
+    match (&config.telegram.webhook_url, &config.telegram.webhook_listen) {
+        (Some(url_str), Some(listen_str)) => {
+            let webhook_url = url_str
+                .parse::<url::Url>()
+                .map_err(|e| anyhow!("webhook_url 解析失败: {}", e))?;
+            if webhook_url.scheme() != "https" {
+                return Err(anyhow!("Telegram Webhook 要求 HTTPS，当前: {}", webhook_url.scheme()));
+            }
+            let addr: SocketAddr = listen_str
+                .parse()
+                .map_err(|e| anyhow!("webhook_listen 解析失败 (例: 0.0.0.0:8443): {}", e))?;
+            tlog!("启动", "使用 Webhook 模式: {} <- {}", webhook_url, addr);
+            let options = webhooks::Options::new(addr, webhook_url);
+            let listener = webhooks::axum(bot, options)
+                .await
+                .map_err(|e| anyhow!("Webhook 设置失败: {:?}", e))?;
+            let err_handler = Arc::new(teloxide::error_handlers::IgnoringErrorHandlerSafe);
+            dp.dispatch_with_listener(listener, err_handler).await;
+        }
+        _ => {
+            tlog!("启动", "清理 webhook...");
+            let delete_url = format!(
+                "https://api.telegram.org/bot{}/deleteWebhook?drop_pending_updates=true",
+                &config.telegram.bot_token
+            );
+            match reqwest::get(&delete_url).await {
+                Ok(resp) => tlog!("启动", "deleteWebhook: {}", resp.status()),
+                Err(e) => tlog!("启动", "deleteWebhook 失败: {}", e),
+            }
+            tlog!("启动", "开始 Long Polling...");
+            dp.dispatch().await;
+        }
+    }
 
     Ok(())
 }

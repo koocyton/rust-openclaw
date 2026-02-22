@@ -4,6 +4,9 @@ bot_token = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
 # 允许的聊天 ID 列表（频道/群组/用户 ID），留空则接收所有消息
 # 获取方式：给 bot 发消息后查看日志中的 chat_id
 allowed_chat_ids = [-1001234567890]
+# 可选：Webhook 模式。与 webhook_listen 同时配置时启用 Webhook（更稳定，适合频道）
+# webhook_url = "https://your-public-domain.com/webhook"
+# webhook_listen = "0.0.0.0:8443"
 
 [llm]
 # OpenAI 兼容 API 的 base URL
