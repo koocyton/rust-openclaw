@@ -24,3 +24,11 @@ model = "openai/gpt-4o"
 timeout_secs = 120
 # 是否在 Telegram 中回显执行结果，默认 true
 echo_result = true
+# 执行前先激活的 Python venv（相对 working_dir 或绝对路径），例如 .venv
+# 则每条命令实际为 source <path>/bin/activate && <原命令>
+# activate_venv = ".venv"
+# 命令失败时向 LLM 询问修正并自动重试的最大次数，0 表示不重试仅展示建议，默认 10
+# max_fix_retries = 10
+
+# 可选：Skills 目录路径，用于加载扩展技能（默认 "skills"）
+# skills_dir = "skills"

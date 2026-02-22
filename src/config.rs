@@ -8,6 +8,9 @@ pub struct AppConfig {
     pub llm: LlmConfig,
     #[serde(default)]
     pub executor: ExecutorConfig,
+    /// Skills 目录路径，用于加载扩展能力；留空或不存在则不使用 skills
+    #[serde(default)]
+    pub skills_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -48,6 +51,13 @@ pub struct ExecutorConfig {
     /// 是否在 Telegram 中回显执行结果
     #[serde(default = "default_true")]
     pub echo_result: bool,
+    /// 执行前先激活的 venv：填 .venv 目录（相对 working_dir 或绝对路径），
+    /// 则每条命令实际为 `source <path>/bin/activate && <原命令>`，使 python 使用 venv 环境
+    #[serde(default)]
+    pub activate_venv: Option<String>,
+    /// 命令失败时向 LLM 询问修正并自动重试的最大次数，0 表示不重试仅展示建议
+    #[serde(default = "default_max_fix_retries")]
+    pub max_fix_retries: u32,
 }
 
 fn default_timeout() -> u64 {
@@ -58,12 +68,18 @@ fn default_true() -> bool {
     true
 }
 
+fn default_max_fix_retries() -> u32 {
+    10
+}
+
 impl Default for ExecutorConfig {
     fn default() -> Self {
         Self {
             working_dir: None,
             timeout_secs: default_timeout(),
             echo_result: true,
+            activate_venv: None,
+            max_fix_retries: default_max_fix_retries(),
         }
     }
 }

@@ -1,0 +1,16 @@
+# 录屏技能：让 LLM 在用户要求录屏时生成 ffmpeg 等命令
+id = "screen_record"
+name = "录屏"
+description = "录制屏幕或摄像头，输出视频到 /tmp"
+prompt_hint = "当用户要求录屏、录屏几秒、录制屏幕时：macOS 必须先执行「列出设备」再录屏，共两条命令：第一条固定为 ffmpeg -nostdin -f avfoundation -list_devices true -i \"\"（描述写「列出 macOS 录屏/摄像头设备」），第二条为录屏命令，必须含 -nostdin、-c:v libx264 -pix_fmt yuv420p，-i 可先写 \"1:0\"（程序会根据第一条输出自动替换为正确屏幕设备号）。录屏命令示例：ffmpeg -nostdin -f avfoundation -video_size 1280x720 -r 30 -i \"1:0\" -t 秒数 -c:v libx264 -pix_fmt yuv420p /tmp/screen_record.mp4。Linux 仅一条：ffmpeg -nostdin -f x11grab -framerate 30 -video_size 1280x720 -i :0.0 -t 秒数 -c:v libx264 -pix_fmt yuv420p /tmp/screen_record.mp4。输出保存到 /tmp/。"
+install = """
+macOS:
+  - 安装 ffmpeg: brew install ffmpeg
+  - 录屏 5 秒（-nostdin 防止挂起，-c:v libx264 -pix_fmt yuv420p 保证 Telegram 正常播放）:
+    ffmpeg -nostdin -f avfoundation -video_size 1280x720 -r 30 -i \"0:0\" -t 5 -c:v libx264 -pix_fmt yuv420p /tmp/screen_record.mp4
+  - 查看设备: ffmpeg -f avfoundation -list_devices true -i \"\"
+
+Linux (X11):
+  - 安装: sudo apt install ffmpeg
+  - 录屏: ffmpeg -nostdin -f x11grab -framerate 30 -video_size 1280x720 -i :0.0 -t 5 -c:v libx264 -pix_fmt yuv420p /tmp/screen_record.mp4
+"""

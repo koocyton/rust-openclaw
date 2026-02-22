@@ -48,8 +48,8 @@ Telegram 频道/群组消息
 3. **分析** — 发送「🔄 正在分析...」，调用 LLM 判断意图
 4. **处理**
    - 提问 → LLM 直接回答，编辑覆盖状态消息
-   - 操作 → 解析命令列表 → 显示执行计划 → 逐条执行 → 回传结果
-5. **图片** — 如果命令输出中包含图片文件路径，自动发送到频道
+   - 操作 → 解析命令列表 → 显示执行计划 → 逐条执行（失败时可自动修正重试）→ 回传结果
+5. **图片/视频** — 如果命令输出中包含图片或视频文件路径，自动发送到频道
 
 ## 快速开始
 
@@ -107,6 +107,27 @@ RUST_LOG=debug ./target/release/rust-bot
 | `executor.working_dir` | 命令执行的工作目录 | 当前目录 |
 | `executor.timeout_secs` | 单条命令超时时间（秒） | `120` |
 | `executor.echo_result` | 是否回传执行结果到 Telegram | `true` |
+| `executor.activate_venv` | 执行前激活的 Python venv 路径（如 `.venv`） | 无 |
+| `executor.max_fix_retries` | 命令失败时向 LLM 询问修正并自动重试的最大次数，0 表示不重试仅展示建议 | `10` |
+| `skills_dir` | Skills 扩展技能目录路径，留空则默认使用项目下的 `skills` 目录 | 无 |
+
+## Skills（扩展技能）
+
+通过 **skills** 可以扩展 bot 能处理的问题类型，而不改主程序代码。每个 skill 是一个子目录，内含 `skill.toml`，定义名称、描述、给 LLM 的提示片段和安装说明。
+
+- **启用**：在项目根下建 `skills` 目录，按 `skills/README.md` 添加 `skill.toml`，可选在 `config.toml` 中设置 `skills_dir = "skills"`。
+- **列出技能**：在 Telegram 中发送「有哪些技能」。
+- **安装方式**：发送「怎么安装 截图」等，可查看对应技能的安装说明。
+
+详见 [skills/README.md](skills/README.md)。
+
+## 错误修复与自动重试
+
+当某条命令执行失败时，程序会向 LLM 询问修正方式，并可从回复中解析出建议的命令自动重试：
+
+- **配置项** `executor.max_fix_retries`：单条命令失败后，最多请求 LLM 修正并重试的次数，默认 **10**。设为 **0** 时不做自动重试，仅把「解决建议」附在报告里给用户参考。
+- **流程**：命令失败 → 将命令、退出码、stderr 发给 LLM（并注入相关 skill 上下文）→ 从回复中解析出修正命令（如代码块或反引号内的内容）→ 执行该命令；若仍失败则重复，直到成功或达到 `max_fix_retries`。全部重试后仍失败时，会在报告末尾再附一次「解决建议」。
+- 这样在环境或参数可被 LLM 修正的情况下，有机会自动执行成功，而无需用户手动改命令再发一次。
 
 ## LLM 接口
 
@@ -130,7 +151,14 @@ src/
 ├── llm_client.rs  # LLM API 调用、意图分类
 ├── executor.rs    # Shell 命令执行
 ├── config.rs      # 配置文件解析
+├── skills.rs      # Skills 加载与提示注入
 └── log.rs         # 带时间戳的日志宏
+skills/            # 扩展技能目录（见 skills/README.md）
+├── README.md      # Skills 使用与安装说明
+├── screenshot/
+│   └── skill.toml
+└── screen_record/
+    └── skill.toml
 ```
 
 ## 安全注意事项

@@ -9,6 +9,7 @@ use tracing::{error, info, warn};
 use crate::config::AppConfig;
 use crate::executor::{CommandResult, Executor, TaskCommand};
 use crate::llm_client::{LlmClient, LlmIntent};
+use crate::skills;
 
 static TASK_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -35,25 +36,43 @@ fn format_results(commands: &[TaskCommand], results: &[CommandResult]) -> String
     msg
 }
 
+/// 按字节截断到 max，保证在 UTF-8 字符边界处切断，避免 panic。
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...(截断)", &s[..max])
+        return s.to_string();
     }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...(截断)", &s[..end])
 }
 
 const IMAGE_EXTENSIONS: &[&str] = &[".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"];
+const VIDEO_EXTENSIONS: &[&str] = &[".mp4", ".webm", ".mov", ".mkv", ".avi"];
+
+fn find_file_paths_by_ext(text: &str, exts: &[&str]) -> Vec<String> {
+    text.split_whitespace()
+        .filter_map(|word| {
+            let path = word.trim_matches(|c| c == '"' || c == '\'');
+            let lower = path.to_lowercase();
+            if exts.iter().any(|ext| lower.ends_with(ext))
+                && (path.starts_with('/') || path.starts_with("./"))
+            {
+                Some(path.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
 
 fn find_image_paths(text: &str) -> Vec<String> {
-    text.split_whitespace()
-        .filter(|word| {
-            let lower = word.to_lowercase();
-            IMAGE_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
-                && (word.starts_with('/') || word.starts_with("./"))
-        })
-        .map(|s| s.to_string())
-        .collect()
+    find_file_paths_by_ext(text, IMAGE_EXTENSIONS)
+}
+
+fn find_video_paths(text: &str) -> Vec<String> {
+    find_file_paths_by_ext(text, VIDEO_EXTENSIONS)
 }
 
 fn find_images_in_results(results: &[CommandResult]) -> Vec<String> {
@@ -66,6 +85,18 @@ fn find_images_in_results(results: &[CommandResult]) -> Vec<String> {
     images.sort();
     images.dedup();
     images
+}
+
+fn find_videos_in_results(results: &[CommandResult]) -> Vec<String> {
+    let mut videos = Vec::new();
+    for r in results {
+        videos.extend(find_video_paths(&r.stdout));
+        videos.extend(find_video_paths(&r.stderr));
+        videos.extend(find_video_paths(&r.command));
+    }
+    videos.sort();
+    videos.dedup();
+    videos
 }
 
 async fn send_images(bot: &Bot, chat_id: ChatId, paths: &[String], tid: u64) {
@@ -92,6 +123,30 @@ async fn send_images(bot: &Bot, chat_id: ChatId, paths: &[String], tid: u64) {
     }
 }
 
+async fn send_videos(bot: &Bot, chat_id: ChatId, paths: &[String], tid: u64) {
+    for path in paths {
+        let file_path = std::path::Path::new(path);
+        if !file_path.exists() {
+            tlog!(&format!("视频 #{tid}"), "文件不存在，跳过: {}", path);
+            continue;
+        }
+        tlog!(&format!("视频 #{tid}"), "发送: {}", path);
+        match bot
+            .send_video(chat_id, InputFile::file(file_path))
+            .await
+        {
+            Ok(_) => tlog!(&format!("视频 #{tid}"), "发送成功: {}", path),
+            Err(e) => {
+                tlog!(&format!("视频 #{tid}"), "发送失败: {} - {}", path, e);
+                error!(err = %e, path = %path, "视频发送失败");
+                bot.send_message(chat_id, format!("⚠️ 视频发送失败 {path}: {e}"))
+                    .await
+                    .ok();
+            }
+        }
+    }
+}
+
 async fn edit_or_send(bot: &Bot, chat_id: ChatId, status_msg_id: Option<MessageId>, text: &str) -> Option<MessageId> {
     if let Some(msg_id) = status_msg_id {
         match bot.edit_message_text(chat_id, msg_id, text).await {
@@ -107,12 +162,226 @@ async fn edit_or_send(bot: &Bot, chat_id: ChatId, status_msg_id: Option<MessageI
     }
 }
 
+fn is_asking_skills_list(text: &str) -> bool {
+    let t = text.trim().to_lowercase();
+    t.contains("有哪些技能") || t.contains("列出技能") || t.contains("有什么技能")
+        || t.contains("list skill") || t.contains("已安装的 skill")
+}
+
+/// 是否为「列出 avfoundation 设备」命令
+fn is_list_avfoundation_devices(cmd: &str) -> bool {
+    let c = cmd.to_lowercase();
+    c.contains("avfoundation") && c.contains("list_devices") && c.contains("-i")
+}
+
+/// 是否为 avfoundation 录屏命令（macOS）
+fn is_avfoundation_record(cmd: &str) -> bool {
+    let c = cmd.to_lowercase();
+    c.contains("avfoundation") && c.contains("-i") && (c.contains("-t") || c.contains(".mp4") || c.contains("screen_record"))
+}
+
+/// 从 ffmpeg -list_devices 的 stdout 中解析第一个「Capture screen」对应的设备索引。
+/// 格式示例: [AVFoundation indev @ 0x...] [1] Capture screen 0
+fn parse_avfoundation_screen_index(stdout: &str) -> Option<u32> {
+    for line in stdout.lines() {
+        if !line.contains("Capture screen") {
+            continue;
+        }
+        let before_cap = match line.find("Capture screen") {
+            Some(p) => &line[..p],
+            None => continue,
+        };
+        let mut idx = before_cap.len();
+        while idx > 0 {
+            let Some(close) = before_cap[..idx].rfind(']') else { break };
+            let Some(open) = before_cap[..close].rfind('[') else { break };
+            let between = before_cap[open + 1..close].trim();
+            if !between.is_empty()
+                && between.chars().all(|c| c.is_ascii_digit())
+                && between.parse::<u32>().is_ok()
+            {
+                return between.parse().ok();
+            }
+            idx = close;
+        }
+    }
+    None
+}
+
+/// 将 avfoundation 录屏命令中的 -i "X:0" 设备号替换为指定索引
+fn replace_avfoundation_device_index(cmd: &str, index: u32) -> String {
+    let mut result = cmd.to_string();
+    let new_index_str = index.to_string();
+    let Some(pos) = result.find("-i ") else { return result };
+    let mut i = pos + 3;
+    let bytes = result.as_bytes();
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+        i += 1;
+    }
+    let num_start = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    let num_end = i;
+    if num_end > num_start && num_end < bytes.len() && bytes[num_end] == b':' && bytes.get(num_end + 1) == Some(&b'0') {
+        result.replace_range(num_start..num_end, &new_index_str);
+    }
+    result
+}
+
+/// 从 LLM 的「解决建议」文本中提取一条可执行的 shell 命令（优先代码块或反引号内的内容）。
+fn extract_command_from_suggestion(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(a) = s.find("```") {
+        let b = s[a + 3..].find("```");
+        let block = if let Some(b) = b {
+            s[a + 3..a + 3 + b].trim()
+        } else {
+            s[a + 3..].trim()
+        };
+        let first_line = block.lines().next().unwrap_or("").trim();
+        if !first_line.is_empty() && !first_line.starts_with('#') {
+            return Some(first_line.to_string());
+        }
+        if block.lines().count() <= 2 {
+            let one = block.lines().filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#')).next();
+            if let Some(line) = one {
+                return Some(line.trim().to_string());
+            }
+        }
+    }
+    if let Some(start) = s.find('`') {
+        let after = &s[start + 1..];
+        if let Some(end) = after.find('`') {
+            let inner = after[..end].trim();
+            if !inner.is_empty() && (inner.contains(' ') || inner.starts_with('/') || inner.starts_with("echo")) {
+                return Some(inner.to_string());
+            }
+        }
+    }
+    for line in s.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with("ffmpeg ")
+            || line.starts_with("python ")
+            || line.starts_with("python3 ")
+            || line.starts_with("/usr/bin/python")
+            || line.starts_with("pip ")
+            || line.starts_with("source ")
+            || (line.starts_with('/') && line.contains("python"))
+        {
+            return Some(line.to_string());
+        }
+    }
+    None
+}
+
+fn extract_install_query(text: &str) -> Option<String> {
+    let t = text.trim();
+    let lower = t.to_lowercase();
+    for prefix in ["怎么安装", "如何安装", "安装 ", "怎么用 "] {
+        if lower.contains(prefix) {
+            let start = lower.find(prefix).unwrap() + prefix.len();
+            let rest = t[start..].trim();
+            let end = rest.find(|c: char| c == '？' || c == '?' || c == '。').unwrap_or(rest.len());
+            let query = rest[..end].trim();
+            if !query.is_empty() {
+                return Some(query.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 逐条执行命令；某条失败时若 max_fix_retries > 0 则向 LLM 询问修正并重试，直到成功或达到上限。
+async fn run_commands_with_fix_retry(
+    executor: &Executor,
+    llm: &LlmClient,
+    skills: &[skills::Skill],
+    commands: &[TaskCommand],
+    max_fix_retries: u32,
+    tag: &str,
+) -> Vec<CommandResult> {
+
+    let mut results = Vec::new();
+    for (i, task) in commands.iter().enumerate() {
+        tlog!(tag, "[{}/{}] {} → {}", i + 1, commands.len(), task.description, truncate(&task.command, 80));
+        let mut result = match executor.run_command(&task.command).await {
+            Ok(r) => r,
+            Err(e) => {
+                tlog!(tag, "命令异常: {}", e);
+                results.push(CommandResult {
+                    command: task.command.clone(),
+                    success: false,
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: e.to_string(),
+                });
+                break;
+            }
+        };
+        let mut retry_count = 0u32;
+        while !result.success && retry_count < max_fix_retries {
+            let fix_context = skills::build_relevant_context_for_fix(skills, &result.command);
+            tlog!(tag, "命令失败，第 {} 次请求 LLM 修正 (最多 {})", retry_count + 1, max_fix_retries);
+            let suggestion = match llm
+                .ask_fix_for_failure(&result.command, result.exit_code, &result.stderr, Some(&fix_context))
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    tlog!(tag, "获取修正建议失败: {}", e);
+                    break;
+                }
+            };
+            let fix_cmd = match extract_command_from_suggestion(suggestion.trim()) {
+                Some(c) => c,
+                None => {
+                    tlog!(tag, "未能从建议中解析出命令，停止重试");
+                    break;
+                }
+            };
+            tlog!(tag, "执行修正命令: {}", truncate(&fix_cmd, 120));
+            match executor.run_command(&fix_cmd).await {
+                Ok(r) => result = r,
+                Err(e) => {
+                    result = CommandResult {
+                        command: fix_cmd,
+                        success: false,
+                        exit_code: None,
+                        stdout: String::new(),
+                        stderr: e.to_string(),
+                    };
+                }
+            }
+            retry_count += 1;
+        }
+        let success = result.success;
+        results.push(result);
+        if !success {
+            tlog!(tag, "命令失败，停止后续执行");
+            break;
+        }
+    }
+    results
+}
+
 async fn process_message(
     bot: Bot,
     chat_id: ChatId,
     text: String,
     llm: Arc<LlmClient>,
     executor: Arc<Executor>,
+    skills: Arc<Vec<skills::Skill>>,
+    max_fix_retries: u32,
     echo_result: bool,
     tid: u64,
 ) {
@@ -127,9 +396,18 @@ async fn process_message(
         .map(|m| m.id);
     tlog!(&tag, "状态消息 ID: {:?}", status_msg_id);
 
+    let prompt_suffix = skills::build_prompt_section(skills.as_slice());
+    let prompt_suffix_opt = if prompt_suffix.is_empty() {
+        tlog!(&tag, "未使用 skills（无技能或未加载）");
+        None
+    } else {
+        tlog!(&tag, "使用 {} 个 skills 注入提示 ({} 字符)", skills.len(), prompt_suffix.len());
+        Some(prompt_suffix.as_str())
+    };
+
     tlog!(&tag, "调用 LLM...");
     let llm_start = Instant::now();
-    let intent = match llm.classify(&text).await {
+    let intent = match llm.classify(&text, prompt_suffix_opt).await {
         Ok(intent) => intent,
         Err(e) => {
             tlog!(&tag, "LLM 失败 (耗时 {:.2}s): {}", llm_start.elapsed().as_secs_f64(), e);
@@ -142,8 +420,16 @@ async fn process_message(
 
     match intent {
         LlmIntent::Question { content } => {
-            tlog!(&tag, "问答回复: {}", truncate(&content, 200));
-            edit_or_send(&bot, chat_id, status_msg_id, &content).await;
+            let reply = if is_asking_skills_list(&text) {
+                skills::list_skills_summary(skills.as_slice())
+            } else if let Some(query) = extract_install_query(&text) {
+                skills::get_install_instructions(skills.as_slice(), &query)
+                    .unwrap_or_else(|| content.clone())
+            } else {
+                content
+            };
+            tlog!(&tag, "问答回复: {}", truncate(&reply, 200));
+            edit_or_send(&bot, chat_id, status_msg_id, &reply).await;
             tlog!(&tag, "回答已发送（覆盖状态消息）");
         }
         LlmIntent::Command { commands } => {
@@ -171,13 +457,56 @@ async fn process_message(
             let plan_text = format!("📝 执行计划:\n{plan}\n\n⏳ 执行中...");
             edit_or_send(&bot, chat_id, status_msg_id, &plan_text).await;
 
-            tlog!(&tag, "开始执行命令...");
+            tlog!(&tag, "开始执行命令... (失败时最多修正重试 {} 次)", max_fix_retries);
             let exec_start = Instant::now();
-            let results = executor.run_commands(&commands).await;
+            let results = if commands.len() >= 2
+                && is_list_avfoundation_devices(&commands[0].command)
+                && is_avfoundation_record(&commands[1].command)
+            {
+                tlog!(&tag, "录屏前先列出 avfoundation 设备...");
+                match executor.run_command(&commands[0].command).await {
+                    Ok(r0) => {
+                        let screen_index = parse_avfoundation_screen_index(&r0.stdout);
+                        let mut rest = commands[1..].to_vec();
+                        if let Some(idx) = screen_index {
+                            tlog!(&tag, "解析到屏幕设备索引: {}", idx);
+                            rest[0].command = replace_avfoundation_device_index(&rest[0].command, idx);
+                            tlog!(&tag, "已替换录屏命令设备号: {}", rest[0].command);
+                        } else {
+                            tlog!(&tag, "未解析到 Capture screen 索引，使用原录屏命令");
+                        }
+                        let rest_results =
+                            run_commands_with_fix_retry(&executor, &llm, skills.as_slice(), &rest, max_fix_retries, &tag).await;
+                        let mut all = vec![r0];
+                        all.extend(rest_results);
+                        all
+                    }
+                    Err(e) => {
+                        tlog!(&tag, "列出设备失败，按原计划执行: {}", e);
+                        run_commands_with_fix_retry(&executor, &llm, skills.as_slice(), &commands, max_fix_retries, &tag).await
+                    }
+                }
+            } else {
+                run_commands_with_fix_retry(&executor, &llm, skills.as_slice(), &commands, max_fix_retries, &tag).await
+            };
             tlog!(&tag, "命令执行完毕 ({} 条, 耗时 {:.2}s)", results.len(), exec_start.elapsed().as_secs_f64());
 
+            let mut report = format_results(&commands, &results);
+            if let Some(failed) = results.last().filter(|r| !r.success) {
+                tlog!(&tag, "最终仍失败，附加一次解决建议到报告");
+                let fix_context = skills::build_relevant_context_for_fix(skills.as_slice(), &failed.command);
+                match llm.ask_fix_for_failure(&failed.command, failed.exit_code, &failed.stderr, Some(&fix_context)).await {
+                    Ok(suggestion) => {
+                        let suggestion_trim = truncate(suggestion.trim(), 1500);
+                        report.push_str(&format!("\n💡 解决建议：\n{suggestion_trim}"));
+                    }
+                    Err(e) => {
+                        report.push_str(&format!("\n⚠️ 获取解决建议失败: {e}"));
+                    }
+                }
+            }
+
             if echo_result {
-                let report = format_results(&commands, &results);
                 edit_or_send(&bot, chat_id, status_msg_id, &report).await;
                 tlog!(&tag, "报告已发送（覆盖状态消息）");
             }
@@ -186,6 +515,11 @@ async fn process_message(
             if !images.is_empty() {
                 tlog!(&tag, "发现 {} 个图片", images.len());
                 send_images(&bot, chat_id, &images, tid).await;
+            }
+            let videos = find_videos_in_results(&results);
+            if !videos.is_empty() {
+                tlog!(&tag, "发现 {} 个视频", videos.len());
+                send_videos(&bot, chat_id, &videos, tid).await;
             }
         }
     }
@@ -199,6 +533,8 @@ async fn handle_message(
     me: teloxide::types::Me,
     llm: Arc<LlmClient>,
     executor: Arc<Executor>,
+    skills: Arc<Vec<skills::Skill>>,
+    max_fix_retries: u32,
     allowed_chats: Vec<i64>,
     echo_result: bool,
 ) -> ResponseResult<()> {
@@ -245,7 +581,7 @@ async fn handle_message(
     info!(chat_id = chat_id.0, text = %text, tid = tid, "收到消息");
 
     tokio::spawn(async move {
-        process_message(bot, chat_id, text, llm, executor, echo_result, tid).await;
+        process_message(bot, chat_id, text, llm, executor, skills, max_fix_retries, echo_result, tid).await;
     });
 
     tlog!(&format!("调度 #{tid}"), "已提交后台处理，立即返回接收下一条消息");
@@ -256,12 +592,14 @@ pub async fn run(config: AppConfig) -> Result<()> {
     let bot = Bot::new(&config.telegram.bot_token);
     let allowed_chats = config.telegram.allowed_chat_ids.clone();
     let echo_result = config.executor.echo_result;
+    let max_fix_retries = config.executor.max_fix_retries;
 
     let llm = Arc::new(LlmClient::new(config.llm.clone()));
     let executor = Arc::new(Executor::new(config.executor.clone()));
+    let skills = Arc::new(skills::load_skills(config.skills_dir.as_deref()));
 
     tlog!("启动", "开始监听 Telegram 消息...");
-    tlog!("启动", "Bot Token: {}...", &config.telegram.bot_token[..config.telegram.bot_token.len().min(10)]);
+    tlog!("启动", "Bot Token: {}...", truncate(&config.telegram.bot_token, 10));
     tlog!("启动", "允许的聊天 ID: {:?}", &config.telegram.allowed_chat_ids);
     tlog!("启动", "模型: {}", &config.llm.model);
 
@@ -273,9 +611,11 @@ pub async fn run(config: AppConfig) -> Result<()> {
                  me: teloxide::types::Me,
                  llm: Arc<LlmClient>,
                  executor: Arc<Executor>,
+                 skills: Arc<Vec<skills::Skill>>,
+                 max_fix_retries: u32,
                  allowed_chats: Vec<i64>,
                  echo_result: bool| {
-                    handle_message(bot, msg, me, llm, executor, allowed_chats, echo_result)
+                    handle_message(bot, msg, me, llm, executor, skills, max_fix_retries, allowed_chats, echo_result)
                 },
             ),
         )
@@ -286,9 +626,11 @@ pub async fn run(config: AppConfig) -> Result<()> {
                  me: teloxide::types::Me,
                  llm: Arc<LlmClient>,
                  executor: Arc<Executor>,
+                 skills: Arc<Vec<skills::Skill>>,
+                 max_fix_retries: u32,
                  allowed_chats: Vec<i64>,
                  echo_result: bool| {
-                    handle_message(bot, msg, me, llm, executor, allowed_chats, echo_result)
+                    handle_message(bot, msg, me, llm, executor, skills, max_fix_retries, allowed_chats, echo_result)
                 },
             ),
         );
@@ -312,6 +654,8 @@ pub async fn run(config: AppConfig) -> Result<()> {
         .dependencies(dptree::deps![
             llm_clone,
             executor_clone,
+            skills,
+            max_fix_retries,
             allowed_chats,
             echo_result
         ])

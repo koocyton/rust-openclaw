@@ -4,6 +4,7 @@ mod bot;
 mod config;
 mod executor;
 mod llm_client;
+mod skills;
 
 use anyhow::Result;
 use tracing::info;

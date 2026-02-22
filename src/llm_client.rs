@@ -6,6 +6,8 @@ use tracing::{debug, info};
 
 use crate::config::LlmConfig;
 
+const FIX_FAILURE_SYSTEM_PROMPT: &str = r#"你是一个命令行故障排查助手。用户会提供一条执行失败的命令以及其错误输出（stderr），请分析原因并给出解决方式或替代命令建议。用简洁的中文回答，可以包含修正后的命令示例。只返回你的分析和建议内容，不要包含多余前缀或 markdown 代码块。"#;
+
 const CLASSIFY_PROMPT: &str = r#"你是一个消息意图分类器。用户通过 Telegram 频道发来消息，你需要判断用户的意图属于以下哪种类型：
 
 1. "question" — 用户在提问、闲聊、咨询，不需要在服务器上执行任何操作
@@ -60,15 +62,22 @@ impl LlmClient {
         Self { client, config }
     }
 
-    pub async fn classify(&self, user_message: &str) -> Result<LlmIntent> {
-        let system_prompt = self
+    /// 分类用户意图。`prompt_suffix` 可选，通常由 skills 模块生成，会追加到系统提示末尾。
+    pub async fn classify(&self, user_message: &str, prompt_suffix: Option<&str>) -> Result<LlmIntent> {
+        let mut system_prompt = self
             .config
             .system_prompt
             .as_deref()
-            .unwrap_or(CLASSIFY_PROMPT);
+            .unwrap_or(CLASSIFY_PROMPT)
+            .to_string();
+        if let Some(suffix) = prompt_suffix {
+            if !suffix.is_empty() {
+                system_prompt.push_str(suffix);
+            }
+        }
 
         tlog!("LLM", ">>> 用户消息: {}", user_message);
-        let raw = self.call_api(system_prompt, user_message).await?;
+        let raw = self.call_api(&system_prompt, user_message).await?;
         tlog!("LLM", "<<< 原始响应 ({} 字符): {}", raw.len(), raw);
 
         let json_text = extract_json_object(&raw);
@@ -90,6 +99,46 @@ impl LlmClient {
         }
 
         Ok(intent)
+    }
+
+    /// 根据命令执行失败信息向 LLM 询问解决方式，返回建议内容。
+    /// `skill_context` 可选，为相关 skill 的 prompt_hint 等，用于让修正建议与已安装技能一致。
+    pub async fn ask_fix_for_failure(
+        &self,
+        command: &str,
+        exit_code: Option<i32>,
+        stderr: &str,
+        skill_context: Option<&str>,
+    ) -> Result<String> {
+        const MAX_STDERR: usize = 3500;
+        let stderr_trim = if stderr.len() > MAX_STDERR {
+            let mut end = MAX_STDERR;
+            while end > 0 && !stderr.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}...(截断)", &stderr[..end])
+        } else {
+            stderr.to_string()
+        };
+        let user_message = format!(
+            "执行失败的命令：\n{}\n\n退出码：{:?}\n\n错误输出（stderr）：\n{}",
+            command,
+            exit_code,
+            stderr_trim
+        );
+        let system_prompt = match skill_context {
+            Some(ctx) if !ctx.is_empty() => format!(
+                "{}\n\n参考以下已安装技能说明，给出与之一致的修正命令（若适用）：\n{}",
+                FIX_FAILURE_SYSTEM_PROMPT,
+                ctx
+            ),
+            _ => FIX_FAILURE_SYSTEM_PROMPT.to_string(),
+        };
+        tlog!("LLM", "询问命令失败解决方式: {}", truncate_str(command, 80));
+        if skill_context.map(|s| !s.is_empty()).unwrap_or(false) {
+            tlog!("LLM", "已注入相关 skill 上下文 ({} 字符)", skill_context.unwrap().len());
+        }
+        self.call_api(&system_prompt, &user_message).await
     }
 
     async fn call_api(&self, system_prompt: &str, user_message: &str) -> Result<String> {
@@ -167,12 +216,16 @@ impl LlmClient {
     }
 }
 
+/// 按字节截断到 max，保证在 UTF-8 字符边界处切断，避免 panic。
 fn truncate_str(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max])
+        return s.to_string();
     }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
 }
 
 fn extract_json_object(text: &str) -> String {

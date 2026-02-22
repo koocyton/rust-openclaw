@@ -1,0 +1,16 @@
+# 截图技能：让 LLM 在用户要求截图/屏幕时生成对应命令
+id = "screenshot"
+name = "截图"
+description = "截取屏幕或窗口，输出图片到 /tmp"
+prompt_hint = "当用户要求截图、截屏、拍屏幕、保存屏幕画面时：macOS 用 screencapture -i -o /tmp/screenshot.png（-i 可选区域），Linux 用 scrot /tmp/screenshot.png 或 import -window root /tmp/screenshot.png。将图片保存到 /tmp/ 下以便 bot 自动发送。"
+install = """
+macOS:
+  - 系统自带 screencapture，无需安装。
+  - 全屏: screencapture /tmp/screenshot.png
+  - 选区: screencapture -i -o /tmp/screenshot.png
+
+Linux:
+  - 安装: sudo apt install scrot  或  sudo apt install imagemagick（使用 import）
+  - 全屏: scrot /tmp/screenshot.png
+  - 或: import -window root /tmp/screenshot.png
+"""
